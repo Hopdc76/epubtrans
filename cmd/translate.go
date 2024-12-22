@@ -49,7 +49,7 @@ Make sure to provide the path to the unpacked EPUB directory and the desired lan
 func init() {
 	Translate.Flags().StringVar(&sourceLanguage, "source", "English", "source language")
 	Translate.Flags().StringVar(&targetLanguage, "target", "Vietnamese", "target language")
-	Translate.Flags().String("model", string(anthropic.ModelClaude3Dot5SonnetLatest), "Anthropic model to use")
+	
 }
 
 type elementToTranslate struct {
@@ -172,7 +172,7 @@ func runTranslate(cmd *cobra.Command, args []string) error {
 		JobBuffer:    1,
 		ResultBuffer: 10,
 	}, func(ctx context.Context, filePath string) error {
-		return processFileDirectly(ctx, filePath, anthropicTranslator, limiter, bookName)
+		return processFileDirectly(ctx, filePath, openAITranslate, limiter, bookName)
 	})
 
 	return err
