@@ -15,11 +15,10 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	""
 	"github.com/nguyenvanduocit/epubtrans/pkg/loader"
 	"github.com/nguyenvanduocit/epubtrans/pkg/processor"
-	"github.com/nguyenvanduocit/epubtrans/pkg/translator"
 	"github.com/nguyenvanduocit/epubtrans/pkg/util"
+	"github.com/sashabaranov/go-openai"
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 )
@@ -32,7 +31,7 @@ var (
 var Translate = &cobra.Command{
 	Use:   "translate [unpackedEpubPath]",
 	Short: "Translate the content of an unpacked EPUB file",
-	Long: `This command translates the content of an unpacked EPUB file using the Anthropic API. 
+	Long: `This command translates the content of an unpacked EPUB file using the OpenAI API. 
 It allows you to specify the source and target languages for the translation. 
 Make sure to provide the path to the unpacked EPUB directory and the desired languages.`,
 	Example: `epubtrans translate path/to/unpacked/epub --source "English" --target "Vietnamese"`,
@@ -49,7 +48,6 @@ Make sure to provide the path to the unpacked EPUB directory and the desired lan
 func init() {
 	Translate.Flags().StringVar(&sourceLanguage, "source", "English", "source language")
 	Translate.Flags().StringVar(&targetLanguage, "target", "Vietnamese", "target language")
-	
 }
 
 type elementToTranslate struct {
@@ -108,63 +106,7 @@ func runTranslate(cmd *cobra.Command, args []string) error {
 
 	limiter := rate.NewLimiter(rate.Every(time.Minute/50), 10)
 
-	
-    const openAIURL = "https://api.openai.com/v1/chat/completions"
-    const apiKey = os.Getenv("OPENAI_API_KEY")
-
-    openAITranslate := func(ctx context.Context, content, sourceLang, targetLang string) (string, error) {
-        payload := map[string]interface{}{
-            "model": "gpt-4",
-            "messages": []map[string]string{
-                {"role": "system", "content": fmt.Sprintf("Translate the following text from %s to %s while preserving HTML structure.", sourceLang, targetLang)},
-                {"role": "user", "content": content},
-            },
-        }
-        body, _ := json.Marshal(payload)
-
-        req, err := http.NewRequestWithContext(ctx, "POST", openAIURL, bytes.NewBuffer(body))
-        if err != nil {
-            return "", err
-        }
-        req.Header.Set("Authorization", "Bearer "+apiKey)
-        req.Header.Set("Content-Type", "application/json")
-
-        client := &http.Client{}
-        resp, err := client.Do(req)
-        if err != nil {
-            return "", err
-        }
-        defer resp.Body.Close()
-
-        if resp.StatusCode != http.StatusOK {
-            responseBody, _ := ioutil.ReadAll(resp.Body)
-            return "", fmt.Errorf("API error: %s", string(responseBody))
-        }
-
-        var result map[string]interface{}
-        responseBody, _ := ioutil.ReadAll(resp.Body)
-        if err := json.Unmarshal(responseBody, &result); err != nil {
-            return "", err
-        }
-
-        if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
-            if message, ok := choices[0].(map[string]interface{})["message"].(map[string]interface{}); ok {
-                return message["content"].(string), nil
-            }
-        }
-
-        return "", fmt.Errorf("unexpected response format")
-    }
-
-    
-		APIKey:      os.Getenv("ANTHROPIC_KEY"),
-		Model:       cmd.Flag("model").Value.String(),
-		Temperature: 0.7,
-		MaxTokens:   8192,
-	})
-	if err != nil {
-		return fmt.Errorf("error getting translator: %v", err)
-	}
+	openaiClient := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 
 	// 1 worker and 1 job at a time, mean 1 file at a time
 	err = processor.ProcessEpub(ctx, unzipPath, processor.Config{
@@ -172,13 +114,13 @@ func runTranslate(cmd *cobra.Command, args []string) error {
 		JobBuffer:    1,
 		ResultBuffer: 10,
 	}, func(ctx context.Context, filePath string) error {
-		return processFileDirectly(ctx, filePath, openAITranslate, limiter, bookName)
+		return processFileDirectly(ctx, filePath, openaiClient, limiter, bookName)
 	})
 
 	return err
 }
 
-func processFileDirectly(ctx context.Context, filePath string, translator translator.Translator, limiter *rate.Limiter, bookName string) error {
+func processFileDirectly(ctx context.Context, filePath string, client *openai.Client, limiter *rate.Limiter, bookName string) error {
     fmt.Printf("\nProcessing file: %s\n", path.Base(filePath))
     
     doc, err := openAndReadFile(filePath)
@@ -225,7 +167,7 @@ func processFileDirectly(ctx context.Context, filePath string, translator transl
             currentBatchLength := getBatchLength(&currentBatch)
             if currentBatchLength+len(htmlContent) > maxBatchLength && len(currentBatch.elements) > 0 {
                 // Process current batch
-                processBatch(ctx, filePath, currentBatch, translator, limiter, bookName)
+                processBatch(ctx, filePath, currentBatch, client, limiter, bookName)
                 // Start new batch
                 currentBatch = translationBatch{
                     elements: []elementToTranslate{element},
@@ -238,36 +180,13 @@ func processFileDirectly(ctx context.Context, filePath string, translator transl
 
     // Process final batch if not empty
     if len(currentBatch.elements) > 0 {
-        processBatch(ctx, filePath, currentBatch, translator, limiter, bookName)
+        processBatch(ctx, filePath, currentBatch, client, limiter, bookName)
     }
 
     return nil
 }
 
-func extractBookName(unzipPath string) (string, error) {
-    container, err := loader.ParseContainer(unzipPath)
-    if err != nil {
-        return "", fmt.Errorf("failed to parse container: %w", err)
-    }
-
-    packagePath := path.Join(unzipPath, container.Rootfile.FullPath)
-    pkg, err := loader.ParsePackage(packagePath)
-    if err != nil {
-        return "", fmt.Errorf("failed to parse package: %w", err)
-    }
-
-    return pkg.Metadata.Title, nil
-}
-
-func getBatchLength(batch *translationBatch) int {
-	var length int
-	for _, element := range batch.elements {
-		length += len(element.content)
-	}
-	return length
-}
-
-func processBatch(ctx context.Context, filePath string, batch translationBatch, anthropicTranslator translator.Translator, limiter *rate.Limiter, bookName string) {
+func processBatch(ctx context.Context, filePath string, batch translationBatch, client *openai.Client, limiter *rate.Limiter, bookName string) {
 	if len(batch.elements) == 0 {
 		return
 	}
@@ -284,11 +203,19 @@ func processBatch(ctx context.Context, filePath string, batch translationBatch, 
 	}
 
 	// Translate combined content
-	translatedContent, err := openAITranslate(ctx, combinedContent.String(), sourceLanguage, targetLanguage)
+	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: "gpt-3.5-turbo",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: "system", Content: "You are a helpful translator."},
+			{Role: "user", Content: combinedContent.String()},
+		},
+	})
 	if err != nil {
 		fmt.Printf("Batch translation error: %v\n", err)
 		return
 	}
+
+	translatedContent := resp.Choices[0].Message.Content
 
 	// Split translated content and process individual elements
 	translations := splitTranslations(translatedContent)
@@ -316,160 +243,4 @@ func processBatch(ctx context.Context, filePath string, batch translationBatch, 
 	if err := writeContentToFile(filePath, batch.elements[0].doc); err != nil {
 		fmt.Printf("Error writing to file: %v\n", err)
 	}
-}
-
-func splitTranslations(translatedContent string) []string {
-	var translations []string
-	segments := strings.Split(translatedContent, "<SEGMENT_")
-	
-	for i := 1; i < len(segments); i++ {
-		if parts := strings.Split(segments[i], "</SEGMENT_"); len(parts) > 1 {
-			// Extract segment number and content
-			segmentContent := parts[0]
-			if idx := strings.Index(segmentContent, ">"); idx != -1 {
-				content := strings.TrimSpace(segmentContent[idx+1:])
-				translations = append(translations, content)
-			}
-		}
-	}
-	
-	return translations
-}
-
-func openAndReadFile(filePath string) (*goquery.Document, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	return goquery.NewDocumentFromReader(file)
-}
-
-func ensureUTF8Charset(doc *goquery.Document) {
-	charset, _ := doc.Find("meta[charset]").Attr("charset")
-	if charset != "utf-8" {
-		doc.Find("head").AppendHtml(`<meta charset="utf-8">`)
-	}
-
-}
-
-func retryTranslate(ctx context.Context, t translator.Translator, limiter *rate.Limiter, content, sourceLang, targetLang, bookName string) (string, error) {
-	maxRetries := 3
-	baseDelay := time.Second
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-			// Wait for rate limiter
-			if err := limiter.Wait(ctx); err != nil {
-				return "", fmt.Errorf("rate limiter error: %w", err)
-			}
-
-			translatedContent, err := t.Translate(ctx, "", content, sourceLang, targetLang, bookName)
-			if err == nil {
-				return translatedContent, nil
-			}
-
-			if errors.Is(err, translator.ErrRateLimitExceeded) {
-				time.Sleep(calculateBackoff(attempt, baseDelay*10))
-			} else {
-				time.Sleep(calculateBackoff(attempt, baseDelay))
-			}
-
-			fmt.Println("Failed to translate, retrying...", err)
-		}
-	}
-
-	return "", fmt.Errorf("max retries reached")
-}
-
-func calculateBackoff(attempt int, baseDelay time.Duration) time.Duration {
-	backoff := float64(baseDelay) * math.Pow(2, float64(attempt))
-	jitter := rand.Float64() * float64(baseDelay)
-	return time.Duration(backoff + jitter)
-}
-
-func isTranslationValid(original, translated string) bool {
-	if translated == original {
-		return true
-	}
-
-	// Check if translation is suspiciously long or short
-	originalWords := countWords(original)
-	translatedWords := countWords(translated)
-	if translatedWords > originalWords*5 || translatedWords < originalWords/5 {
-		return false
-	}
-
-	// Ensure all HTML tags are preserved
-	originalTags := extractHTMLTags(original)
-	translatedTags := extractHTMLTags(translated)
-	
-	if len(originalTags) != len(translatedTags) {
-		return false
-	}
-	
-	for i := range originalTags {
-		if originalTags[i] != translatedTags[i] {
-			return false
-		}
-	}
-
-	return true
-}
-
-func extractHTMLTags(html string) []string {
-	var tags []string
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return tags
-	}
-	
-	doc.Find("*").Each(func(i int, s *goquery.Selection) {
-		tags = append(tags, goquery.NodeName(s))
-	})
-	
-	return tags
-}
-
-func manipulateHTML(doc *goquery.Selection, targetLang, translatedContent string) error {
-	translationID, err := generateContentID([]byte(translatedContent + targetLang))
-	if err != nil {
-		return err
-	}
-
-	translatedElement := doc.Clone()
-	translatedElement.RemoveAttr(util.ContentIdKey)
-	translatedElement.SetHtml(translatedContent)
-	translatedElement.SetAttr(util.TranslationIdKey, translationID)
-	translatedElement.SetAttr(util.TranslationLangKey, targetLang)
-
-	doc.SetAttr(util.TranslationByIdKey, translationID)
-	doc.AfterSelection(translatedElement)
-
-	return nil
-}
-
-func writeContentToFile(filePath string, doc *goquery.Document) error {
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	html, err := doc.Html()
-	if err != nil {
-		return err
-	}
-
-	_, err = file.WriteString(html)
-	return err
-}
-
-func countWords(text string) int {
-	words := strings.Fields(text)
-	return len(words)
 }
